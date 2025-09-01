@@ -138,6 +138,8 @@
     const DROP_BASE_MS = 900; // start drop interval
     const SPEED_PER_LEVEL = 0.85; // speed factor per level
     const LINES_PER_LEVEL = 10;
+    // Matte, sand-friendly palette (5 colors)
+    const COLORS = ['#d49f6a', '#e4c979', '#9ebd81', '#7fb3c8', '#c39ac5'];
 
     // Shapes (tetrominoes)
     const SHAPES = {
@@ -203,6 +205,16 @@
       }
       return res;
     }
+    function rotateAny(mat) {
+      const h = mat.length, w = mat[0].length;
+      const res = Array.from({ length: w }, () => Array(h).fill(0));
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          res[x][h - 1 - y] = mat[y][x];
+        }
+      }
+      return res;
+    }
 
     function clone(m) { return m.map(row => row.slice()); }
 
@@ -225,9 +237,12 @@
     function spawnPiece() {
       const key = bag.next();
       const shape = clone(SHAPES[key]);
+      // assign random color index (1..COLORS.length) per filled cell
+      const colors = shape.map(row => row.map(v => v ? (1 + (Math.random() * COLORS.length | 0)) : 0));
       const piece = {
         key,
         shape,
+        colors,
         x: Math.floor((COLS - shape[0].length) / 2),
         y: 0,
       };
@@ -283,26 +298,103 @@
           if (!piece.shape[y][x]) continue;
           const nx = piece.x + x;
           const ny = piece.y + y;
-          if (ny >= 0) board[ny][nx] = 1;
+          if (ny >= 0) board[ny][nx] = piece.colors[y][x];
         }
       }
     }
 
-    // Line clear
-    function sweep() {
-      let cleared = 0;
+    // Gravity: collapse columns after removals
+    function applyGravity() {
+      for (let x = 0; x < COLS; x++) {
+        let write = ROWS - 1;
+        for (let y = ROWS - 1; y >= 0; y--) {
+          if (board[y][x]) {
+            const val = board[y][x];
+            if (write !== y) {
+              board[write][x] = val;
+              board[y][x] = 0;
+            }
+            write--;
+          }
+        }
+        for (let y = write; y >= 0; y--) board[y][x] = 0;
+      }
+    }
+
+    function clearFullLines() {
+      let linesCleared = 0;
+      let blocksRemoved = 0;
       for (let y = ROWS - 1; y >= 0; y--) {
         if (board[y].every(v => v)) {
+          blocksRemoved += COLS;
           board.splice(y, 1);
           board.unshift(Array(COLS).fill(0));
-          cleared++;
-          y++; // recheck this row index after unshift
+          linesCleared++;
+          y++;
         }
       }
-      if (cleared > 0) {
-        // Score equals number of cleared lines
-        score += cleared;
-        lines += cleared;
+      return { linesCleared, blocksRemoved };
+    }
+
+    function clearColorGroups() {
+      let removed = 0;
+      const seen = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
+      const toClear = [];
+      const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+          const color = board[y][x];
+          if (!color || seen[y][x]) continue;
+          // BFS
+          const stack = [[x,y]];
+          const comp = [];
+          seen[y][x] = true;
+          while (stack.length) {
+            const [cx, cy] = stack.pop();
+            comp.push([cx, cy]);
+            for (const [dx, dy] of dirs) {
+              const nx = cx + dx, ny = cy + dy;
+              if (nx>=0 && nx<COLS && ny>=0 && ny<ROWS && !seen[ny][nx] && board[ny][nx] === color) {
+                seen[ny][nx] = true;
+                stack.push([nx, ny]);
+              }
+            }
+          }
+          if (comp.length >= 5) {
+            for (const [cx, cy] of comp) {
+              toClear.push([cx, cy]);
+            }
+          }
+        }
+      }
+      if (toClear.length) {
+        for (const [x, y] of toClear) board[y][x] = 0;
+        removed = toClear.length;
+      }
+      return removed;
+    }
+
+    // Process clears repeatedly to allow cascades
+    function sweep() {
+      let any = false;
+      let totalBlocks = 0;
+      let totalLines = 0;
+      while (true) {
+        const { linesCleared, blocksRemoved } = clearFullLines();
+        let colorRemoved = 0;
+        if (linesCleared === 0) {
+          // if no line clear, try color groups
+          colorRemoved = clearColorGroups();
+        }
+        if (linesCleared === 0 && colorRemoved === 0) break;
+        totalLines += linesCleared;
+        totalBlocks += blocksRemoved + colorRemoved;
+        applyGravity();
+        any = true;
+      }
+      if (any) {
+        score += totalBlocks; // score by blocks removed
+        lines += totalLines;  // lines for leveling
         setLevelFromLines();
         updateHUD();
       }
@@ -310,13 +402,16 @@
 
     // Rotation with wall kicks (simple)
     function tryRotate(dir = 1) {
-      const rotated = rotate(current.shape);
+      const rotShape = rotate(current.shape);
+      const rotColors = rotateAny(current.colors);
       // For counter-rotate, rotate 3 times
-      const shape = dir === 1 ? rotated : rotate(rotate(rotate(current.shape)));
+      const shape = dir === 1 ? rotShape : rotate(rotate(rotate(current.shape)));
+      const colors = dir === 1 ? rotColors : rotateAny(rotateAny(rotateAny(current.colors)));
       const kicks = [0, -1, 1, -2, 2];
       for (const k of kicks) {
         if (!collides(current, k, 0, shape)) {
           current.shape = shape;
+          current.colors = colors;
           current.x += k;
           return true;
         }
@@ -325,9 +420,7 @@
     }
 
     // Draw helpers
-    function drawCell(g, x, y, size) {
-      const px = x * size;
-      const py = y * size;
+    function drawCellAt(g, px, py, size, colorIndex) {
       // Base sand fill
       g.fillStyle = sandPattern;
       g.fillRect(px, py, size, size);
@@ -343,6 +436,20 @@
       // Soft shadow
       g.fillStyle = 'rgba(0,0,0,0.06)';
       g.fillRect(px+2, py+size-2, size-4, 2);
+      // Color tint overlay
+      if (colorIndex) {
+        g.save();
+        g.globalAlpha = 0.4;
+        g.fillStyle = COLORS[colorIndex - 1];
+        g.fillRect(px, py, size, size);
+        g.restore();
+      }
+    }
+
+    function drawCell(g, x, y, size, colorIndex) {
+      const px = x * size;
+      const py = y * size;
+      drawCellAt(g, px, py, size, colorIndex);
     }
 
     function drawBackground() {
@@ -395,7 +502,8 @@
     function drawBoard() {
       for (let y = 0; y < ROWS; y++) {
         for (let x = 0; x < COLS; x++) {
-          if (board[y][x]) drawCell(ctx, x, y, CELL);
+          const c = board[y][x];
+          if (c) drawCell(ctx, x, y, CELL, c);
         }
       }
     }
@@ -406,14 +514,15 @@
           if (!piece.shape[y][x]) continue;
           const gx = piece.x + x;
           const gy = piece.y + y;
-          if (gy >= 0) drawCell(g, gx, gy, size);
+          const colorIndex = piece.colors[y][x];
+          if (gy >= 0) drawCell(g, gx, gy, size, colorIndex);
         }
       }
     }
 
     function drawGhost() {
       // Drop ghost piece preview
-      const ghost = { x: current.x, y: current.y, shape: current.shape };
+      const ghost = { x: current.x, y: current.y, shape: current.shape, colors: current.colors };
       while (!collides(ghost, 0, 1)) ghost.y++;
       ctx.save();
       ctx.globalAlpha = 0.18;
@@ -441,15 +550,8 @@
           // local cell renderer
           const px = x * size;
           const py = y * size;
-          nctx.fillStyle = sandPattern;
-          nctx.fillRect(px, py, size, size);
-          nctx.fillStyle = 'rgba(255,255,255,0.35)';
-          nctx.fillRect(px+1, py+1, size-2, 4);
-          nctx.fillStyle = 'rgba(0,0,0,0.12)';
-          nctx.fillRect(px+1, py+size-4, size-2, 3);
-          nctx.strokeStyle = 'rgba(0,0,0,0.30)';
-          nctx.lineWidth = 1.2;
-          nctx.strokeRect(px+0.5, py+0.5, size-1, size-1);
+          const colorIndex = nextPiece.colors[y][x];
+          drawCellAt(nctx, px, py, size, colorIndex);
         }
       }
       nctx.restore();
@@ -500,7 +602,7 @@
       ctx.font = 'bold 22px system-ui, sans-serif';
       ctx.fillText('Game Over', canvas.width/2, canvas.height/2 - 24);
       ctx.font = '14px system-ui, sans-serif';
-      ctx.fillText('Score: ' + score + ' lines', canvas.width/2, canvas.height/2 + -2);
+      ctx.fillText('Score: ' + score, canvas.width/2, canvas.height/2 + -2);
       ctx.fillText('Press R to restart', canvas.width/2, canvas.height/2 + 20);
       ctx.restore();
     }
