@@ -138,8 +138,8 @@
     const DROP_BASE_MS = 900; // start drop interval
     const SPEED_PER_LEVEL = 0.85; // speed factor per level
     const LINES_PER_LEVEL = 10;
-    // Matte, sand-friendly palette (5 colors)
-    const COLORS = ['#d49f6a', '#e4c979', '#9ebd81', '#7fb3c8', '#c39ac5'];
+    // Matte, sand-friendly palette (4 colors)
+    const COLORS = ['#d49f6a', '#e4c979', '#9ebd81', '#7fb3c8'];
 
     // Shapes (tetrominoes)
     const SHAPES = {
@@ -260,6 +260,11 @@
     let dropAccumulator = 0;
     let paused = false;
     let gameOver = false;
+    let resolving = false; // animating clears
+    let pendingNextPiece = null; // spawn after clears
+    let clearing = null; // { cells: Set<'x,y'>, lineRows: number, endTime: number }
+    let clearFade = 0; // 0..1 fade progress for clearing
+    let animToken = 0; // invalidates pending animations on restart
 
     function updateHUD() {
       scoreEl.textContent = score;
@@ -321,31 +326,21 @@
       }
     }
 
-    function clearFullLines() {
-      let linesCleared = 0;
-      let blocksRemoved = 0;
-      for (let y = ROWS - 1; y >= 0; y--) {
-        if (board[y].every(v => v)) {
-          blocksRemoved += COLS;
-          board.splice(y, 1);
-          board.unshift(Array(COLS).fill(0));
-          linesCleared++;
-          y++;
-        }
-      }
-      return { linesCleared, blocksRemoved };
+    // Detect clears without mutating
+    function getFullLineRows() {
+      const rows = [];
+      for (let y = 0; y < ROWS; y++) if (board[y].every(v => v)) rows.push(y);
+      return rows;
     }
 
-    function clearColorGroups() {
-      let removed = 0;
+    function findColorGroupCells() {
       const seen = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
-      const toClear = [];
       const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+      const cells = [];
       for (let y = 0; y < ROWS; y++) {
         for (let x = 0; x < COLS; x++) {
           const color = board[y][x];
           if (!color || seen[y][x]) continue;
-          // BFS
           const stack = [[x,y]];
           const comp = [];
           seen[y][x] = true;
@@ -360,44 +355,53 @@
               }
             }
           }
-          if (comp.length >= 5) {
-            for (const [cx, cy] of comp) {
-              toClear.push([cx, cy]);
-            }
-          }
+          if (comp.length >= 5) for (const c of comp) cells.push(c);
         }
       }
-      if (toClear.length) {
-        for (const [x, y] of toClear) board[y][x] = 0;
-        removed = toClear.length;
-      }
-      return removed;
+      return cells; // array of [x,y]
     }
 
-    // Process clears repeatedly to allow cascades
-    function sweep() {
-      let any = false;
-      let totalBlocks = 0;
-      let totalLines = 0;
-      while (true) {
-        const { linesCleared, blocksRemoved } = clearFullLines();
-        let colorRemoved = 0;
-        if (linesCleared === 0) {
-          // if no line clear, try color groups
-          colorRemoved = clearColorGroups();
+    function computeClears() {
+      const lineRows = getFullLineRows();
+      const colorCells = findColorGroupCells();
+      if (lineRows.length === 0 && colorCells.length === 0) return null;
+      const cells = new Set();
+      for (const y of lineRows) for (let x = 0; x < COLS; x++) cells.add(`${x},${y}`);
+      for (const [x,y] of colorCells) cells.add(`${x},${y}`);
+      return { cells, lineRows };
+    }
+
+    function resolveStep() {
+      const clears = computeClears();
+      if (!clears) {
+        resolving = false;
+        clearing = null;
+        clearFade = 0;
+        if (pendingNextPiece) {
+          current = pendingNextPiece;
+          pendingNextPiece = null;
+          if (collides(current, 0, 0)) { gameOver = true; paused = true; showGameOver(); }
         }
-        if (linesCleared === 0 && colorRemoved === 0) break;
-        totalLines += linesCleared;
-        totalBlocks += blocksRemoved + colorRemoved;
-        applyGravity();
-        any = true;
+        return;
       }
-      if (any) {
-        score += totalBlocks; // score by blocks removed
-        lines += totalLines;  // lines for leveling
+      const token = animToken;
+      clearing = { cells: clears.cells, lineRows: clears.lineRows.length, endTime: performance.now() + 500 };
+      setTimeout(() => {
+        if (token !== animToken) return; // aborted
+        let removed = 0;
+        for (const key of clearing.cells) {
+          const [sx, sy] = key.split(',').map(Number);
+          if (board[sy][sx]) { board[sy][sx] = 0; removed++; }
+        }
+        score += removed;
+        lines += clearing.lineRows;
         setLevelFromLines();
         updateHUD();
-      }
+        applyGravity();
+        clearing = null;
+        clearFade = 0;
+        setTimeout(() => { if (token === animToken) resolveStep(); }, 20);
+      }, 500);
     }
 
     // Rotation with wall kicks (simple)
@@ -420,7 +424,7 @@
     }
 
     // Draw helpers
-    function drawCellAt(g, px, py, size, colorIndex) {
+    function drawCellAt(g, px, py, size, colorIndex, tintAlpha = 0.4) {
       // Base sand fill
       g.fillStyle = sandPattern;
       g.fillRect(px, py, size, size);
@@ -439,17 +443,20 @@
       // Color tint overlay
       if (colorIndex) {
         g.save();
-        g.globalAlpha = 0.4;
+        g.globalAlpha = tintAlpha;
         g.fillStyle = COLORS[colorIndex - 1];
         g.fillRect(px, py, size, size);
         g.restore();
       }
     }
 
-    function drawCell(g, x, y, size, colorIndex) {
+    function drawCell(g, x, y, size, colorIndex, overallAlpha = 1, tintAlpha = 0.4) {
       const px = x * size;
       const py = y * size;
-      drawCellAt(g, px, py, size, colorIndex);
+      g.save();
+      g.globalAlpha = overallAlpha;
+      drawCellAt(g, px, py, size, colorIndex, tintAlpha);
+      g.restore();
     }
 
     function drawBackground() {
@@ -503,19 +510,27 @@
       for (let y = 0; y < ROWS; y++) {
         for (let x = 0; x < COLS; x++) {
           const c = board[y][x];
-          if (c) drawCell(ctx, x, y, CELL, c);
+          if (c) {
+            let alpha = 1;
+            if (clearing && clearing.cells && clearing.cells.has(`${x},${y}`)) {
+              alpha = 1 - clearFade; // fade out over time
+            }
+            drawCell(ctx, x, y, CELL, c, alpha, 0.4);
+          }
         }
       }
     }
 
-    function drawPiece(g, piece, size) {
+    function drawPiece(g, piece, size, opts = {}) {
+      const overallAlpha = opts.overallAlpha ?? 1;
+      const tintAlpha = opts.tintAlpha ?? 0.4;
       for (let y = 0; y < piece.shape.length; y++) {
         for (let x = 0; x < piece.shape[y].length; x++) {
           if (!piece.shape[y][x]) continue;
           const gx = piece.x + x;
           const gy = piece.y + y;
           const colorIndex = piece.colors[y][x];
-          if (gy >= 0) drawCell(g, gx, gy, size, colorIndex);
+          if (gy >= 0) drawCell(g, gx, gy, size, colorIndex, overallAlpha, tintAlpha);
         }
       }
     }
@@ -524,10 +539,8 @@
       // Drop ghost piece preview
       const ghost = { x: current.x, y: current.y, shape: current.shape, colors: current.colors };
       while (!collides(ghost, 0, 1)) ghost.y++;
-      ctx.save();
-      ctx.globalAlpha = 0.18;
-      drawPiece(ctx, ghost, CELL);
-      ctx.restore();
+      // Very light projection
+      drawPiece(ctx, ghost, CELL, { overallAlpha: 0.22, tintAlpha: 0.1 });
     }
 
     function drawNext() {
@@ -562,7 +575,7 @@
     function loop(ts) {
       const dt = Math.min(32, ts - last);
       last = ts;
-      if (!paused && !gameOver) {
+      if (!paused && !gameOver && !resolving) {
         dropAccumulator += dt;
         if (dropAccumulator >= dropInterval) {
           dropAccumulator = 0;
@@ -577,15 +590,13 @@
       if (!collides(current, 0, 1)) {
         current.y++;
       } else {
+        // Lock piece and start animated clear cascade
         merge(current);
-        sweep();
-        current = nextPiece;
+        pendingNextPiece = nextPiece;
         nextPiece = spawnPiece();
-        if (collides(current, 0, 0)) {
-          gameOver = true;
-          paused = true;
-          showGameOver();
-        }
+        current = null; // hide piece during resolution
+        resolving = true;
+        resolveStep();
       }
     }
 
@@ -623,10 +634,17 @@
     }
 
     function render() {
+      // Update clear fade progress for animation
+      if (clearing && clearing.endTime) {
+        const remain = Math.max(0, clearing.endTime - performance.now());
+        clearFade = Math.min(1, 1 - (remain / 500));
+      } else {
+        clearFade = 0;
+      }
       drawBackground();
-      drawGhost();
+      if (current && !resolving) drawGhost();
       drawBoard();
-      drawPiece(ctx, current, CELL);
+      if (current) drawPiece(ctx, current, CELL);
       drawNext();
       if (paused && !gameOver) showPaused();
       if (gameOver) showGameOver();
@@ -637,7 +655,7 @@
     document.addEventListener('keydown', (e) => {
       if (gameOver && e.key.toLowerCase() === 'r') { restart(); return; }
       if (e.key.toLowerCase() === 'p') { paused = !paused; return; }
-      if (paused) return;
+      if (paused || resolving || !current) return;
       switch (e.key) {
         case 'ArrowLeft':
           if (!collides(current, -1, 0)) current.x--;
@@ -653,12 +671,11 @@
           e.preventDefault();
           while (!collides(current, 0, 1)) { current.y++; }
           merge(current);
-          sweep();
-          current = nextPiece;
+          pendingNextPiece = nextPiece;
           nextPiece = spawnPiece();
-          if (collides(current, 0, 0)) {
-            gameOver = true; paused = true; showGameOver();
-          }
+          current = null;
+          resolving = true;
+          resolveStep();
           break;
         case 'ArrowUp':
         case 'x':
@@ -687,6 +704,7 @@
       nextPiece = spawnPiece();
       score = 0; lines = 0; level = 1;
       paused = false; gameOver = false;
+      resolving = false; pendingNextPiece = null; clearing = null; clearFade = 0; animToken++;
       dropInterval = DROP_BASE_MS; dropAccumulator = 0; last = 0;
       updateHUD();
       render();
