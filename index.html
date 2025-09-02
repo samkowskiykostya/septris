@@ -93,6 +93,41 @@
       opacity: 0.7;
       margin-top: 8px;
     }
+
+    /* Overlay UI for menu and level complete */
+    .overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.12);
+      z-index: 10;
+    }
+    .overlay-inner {
+      background: rgba(255, 255, 255, 0.85);
+      backdrop-filter: blur(2px);
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 12px;
+      padding: 18px 20px;
+      min-width: 280px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+      color: var(--text);
+    }
+    .overlay h2 { margin: 0 0 8px; font-size: 20px; }
+    .overlay p { margin: 8px 0; font-size: 14px; opacity: 0.9; }
+    .overlay .row { display: flex; gap: 10px; align-items: center; }
+    .btn {
+      display: inline-block;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(0,0,0,0.1);
+      background: #f0e7c9;
+      color: #4b4125;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn:hover { filter: brightness(0.98); }
   </style>
   <link rel="icon" href="data:,">
   <meta name="color-scheme" content="light">
@@ -110,6 +145,7 @@
         <div class="stat-label">Score</div><div id="score" class="stat-value">0</div>
         <div class="stat-label">Lines</div><div id="lines" class="stat-value">0</div>
         <div class="stat-label">Level</div><div id="level" class="stat-value">1</div>
+        <div class="stat-label">Goal</div><div id="goal" class="stat-value">—</div>
       </div>
       <div class="next-wrap">
         <div class="stat-label">Next</div>
@@ -127,6 +163,17 @@
     </div>
 
     <canvas id="game" width="300" height="600" class="panel"></canvas>
+    <div id="overlay" class="overlay">
+      <div class="overlay-inner">
+        <h2 id="overlay-title">Sand Tetris</h2>
+        <p id="overlay-desc">Stack shapes of sand. Clear full rows to score.</p>
+        <p id="overlay-progress">Levels beaten: <strong id="levels-beaten">0</strong></p>
+        <div class="row" style="margin-top: 10px;">
+          <button id="btn-play" class="btn">Play</button>
+          <button id="btn-reset" class="btn" title="Reset progress">Reset</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -135,9 +182,8 @@
     const ROWS = 20;
     const CELL = 30; // 10 x 20 grid => 300x600 canvas
 
-    const DROP_BASE_MS = 900; // start drop interval
-    const SPEED_PER_LEVEL = 0.85; // speed factor per level
-    const LINES_PER_LEVEL = 10;
+    const DROP_BASE_MS = 900; // base drop interval
+    const SPEED_PER_STAGE = 0.92; // gentle speed-up per level
     // Matte, sand-friendly palette (4 colors)
     const COLORS = ['#d49f6a', '#e4c979', '#9ebd81', '#7fb3c8'];
 
@@ -159,11 +205,18 @@
     const ctx = canvas.getContext('2d');
     const nextCanvas = document.getElementById('next');
     const nctx = nextCanvas.getContext('2d');
+    const overlayEl = document.getElementById('overlay');
+    const overlayTitle = document.getElementById('overlay-title');
+    const overlayDesc = document.getElementById('overlay-desc');
+    const overlayProgress = document.getElementById('levels-beaten');
+    const btnPlay = document.getElementById('btn-play');
+    const btnReset = document.getElementById('btn-reset');
 
     // UI
     const scoreEl = document.getElementById('score');
     const linesEl = document.getElementById('lines');
     const levelEl = document.getElementById('level');
+    const goalEl = document.getElementById('goal');
 
     // Sand pattern generator
     function makeSandPattern(base = '#ecd9ad') {
@@ -249,13 +302,13 @@
       return piece;
     }
 
-    let current = spawnPiece();
-    let nextPiece = spawnPiece();
+    let current = null;
+    let nextPiece = null;
 
     // Game state
     let score = 0;
     let lines = 0;
-    let level = 1;
+    let stage = 1; // 1-based visible stage number
     let dropInterval = DROP_BASE_MS;
     let dropAccumulator = 0;
     let paused = false;
@@ -265,19 +318,33 @@
     let clearing = null; // { cells: Set<'x,y'>, lineRows: number[], endTime: number }
     let clearFade = 0; // 0..1 fade progress for clearing
     let animToken = 0; // invalidates pending animations on restart
+    let inMenu = true;
+    let levelComplete = false;
+    let levelsBeaten = 0;
+
+    // Per-level progress
+    let levelScore = 0;
+    let levelLines = 0;
+    let levelColorCounts = Array(COLORS.length + 1).fill(0); // index by colorIndex
+    let currentGoal = null; // { type: 'lines'|'score'|'color', target: n, color?: idx }
 
     function updateHUD() {
       scoreEl.textContent = score;
       linesEl.textContent = lines;
-      levelEl.textContent = level;
+      levelEl.textContent = stage;
+      goalEl.textContent = currentGoal ? goalToText(currentGoal) : '—';
     }
 
-    function setLevelFromLines() {
-      const newLevel = 1 + Math.floor(lines / LINES_PER_LEVEL);
-      if (newLevel !== level) {
-        level = newLevel;
-        dropInterval = Math.max(80, DROP_BASE_MS * Math.pow(SPEED_PER_LEVEL, level - 1));
+    function goalToText(goal) {
+      switch (goal.type) {
+        case 'lines': return `Clear ${goal.target} lines`;
+        case 'score': return `Score ${goal.target}`;
+        case 'color': {
+          const colorName = ['A','B','C','D'][goal.color-1] || 'color';
+          return `Remove ${goal.target} of ${colorName}`;
+        }
       }
+      return '—';
     }
 
     // Collision
@@ -378,7 +445,7 @@
         resolving = false;
         clearing = null;
         clearFade = 0;
-        if (pendingNextPiece) {
+        if (!levelComplete && pendingNextPiece) {
           current = pendingNextPiece;
           pendingNextPiece = null;
           if (collides(current, 0, 0)) { gameOver = true; paused = true; showGameOver(); }
@@ -391,18 +458,32 @@
       setTimeout(() => {
         if (token !== animToken) return; // aborted
         let removed = 0;
+        const removedByColor = Array(COLORS.length + 1).fill(0);
         for (const key of clearing.cells) {
           const [sx, sy] = key.split(',').map(Number);
-          if (board[sy][sx]) { board[sy][sx] = 0; removed++; }
+          const val = board[sy][sx];
+          if (val) {
+            removed++;
+            removedByColor[val]++;
+            board[sy][sx] = 0;
+          }
         }
         score += removed;
         lines += clearing.lineRows.length;
-        setLevelFromLines();
+        // Level-local tallies
+        levelScore += removed;
+        levelLines += clearing.lineRows.length;
+        for (let i = 1; i < removedByColor.length; i++) levelColorCounts[i] += removedByColor[i];
         updateHUD();
         // Only apply gravity for line clears. Cluster clears leave gaps.
         applyLineClearGravity(clearing.lineRows);
         clearing = null;
         clearFade = 0;
+        // Check for goal completion before continuing chain/spawn
+        if (checkGoalComplete()) {
+          onLevelComplete();
+          return;
+        }
         setTimeout(() => { if (token === animToken) resolveStep(); }, 20);
       }, 500);
     }
@@ -550,6 +631,7 @@
       nctx.clearRect(0, 0, nextCanvas.width, nextCanvas.height);
       nctx.fillStyle = 'rgba(255,255,255,0.65)';
       nctx.fillRect(0,0,nextCanvas.width,nextCanvas.height);
+      if (!nextPiece) return;
       const s = nextPiece.shape;
       const size = 24;
       // Centering
@@ -649,7 +731,7 @@
       drawBoard();
       if (current) drawPiece(ctx, current, CELL);
       drawNext();
-      if (paused && !gameOver) showPaused();
+      if (paused && !gameOver && !inMenu && !levelComplete) showPaused();
       if (gameOver) showGameOver();
     }
 
@@ -657,6 +739,7 @@
     let heldDown = false; // to accelerate soft drop
     document.addEventListener('keydown', (e) => {
       if (gameOver && e.key.toLowerCase() === 'r') { restart(); return; }
+      if (inMenu || levelComplete) return;
       if (e.key.toLowerCase() === 'p') { paused = !paused; return; }
       if (paused || resolving || !current) return;
       switch (e.key) {
@@ -701,21 +784,157 @@
     });
 
     // Restart
-    function restart() {
+    function restart() { // restart current level
+      startLevel(stage - 1);
+    }
+
+    // ---- Levels & Menu ----
+    function loadProgress() {
+      const v = localStorage.getItem('sand_levels_beaten');
+      levelsBeaten = v ? Math.max(0, parseInt(v, 10) || 0) : 0;
+    }
+    function saveProgress() {
+      localStorage.setItem('sand_levels_beaten', String(levelsBeaten));
+    }
+
+    function getLevelConfig(idx0) { // 0-based index
+      const speed = Math.max(120, DROP_BASE_MS * Math.pow(SPEED_PER_STAGE, idx0));
+      const startRows = Math.min(12, Math.floor(idx0 / 2));
+      const density = Math.min(0.6, 0.25 + idx0 * 0.02);
+      const t = idx0 % 3; // rotate goal types
+      if (t === 0) {
+        return { dropMs: speed, startRows, density, goal: { type: 'lines', target: 2 + Math.floor(idx0 / 2) } };
+      } else if (t === 1) {
+        const color = 1 + (Math.random() * COLORS.length | 0);
+        return { dropMs: speed, startRows, density, goal: { type: 'color', color, target: 12 + idx0 * 3 } };
+      } else {
+        return { dropMs: speed, startRows, density, goal: { type: 'score', target: 60 + idx0 * 40 } };
+      }
+    }
+
+    function seedStartingRows(rows, density) {
+      // Clear board
       board = makeBoard();
+      if (rows <= 0) return;
+      const startY = ROWS - rows;
+      // Fill with random occupancy avoiding full lines
+      for (let y = startY; y < ROWS; y++) {
+        let filledCount = 0;
+        for (let x = 0; x < COLS; x++) {
+          if (Math.random() < density) {
+            const color = 1 + (Math.random() * COLORS.length | 0);
+            board[y][x] = color; filledCount++;
+          }
+        }
+        if (filledCount === COLS) {
+          const rx = (Math.random() * COLS) | 0; // knock one out
+          board[y][rx] = 0;
+        }
+      }
+      // Break any accidental clusters >=5 by random thinning/recolor
+      let safety = 0;
+      while (true && safety < 200) {
+        safety++;
+        const groups = findColorGroupCells();
+        if (groups.length === 0) break;
+        // Recolor a random cell from each group to a different color or empty
+        for (let i = 0; i < groups.length; i++) {
+          const [gx, gy] = groups[i];
+          if (gy < startY) continue; // only adjust seeded area
+          if (Math.random() < 0.5) {
+            board[gy][gx] = 0;
+          } else {
+            const old = board[gy][gx];
+            let nc = old;
+            for (let tries = 0; tries < 4 && nc === old; tries++) nc = 1 + ((Math.random() * COLORS.length) | 0);
+            board[gy][gx] = nc;
+          }
+        }
+      }
+      // Ensure seeded rows are not full lines
+      for (let y = startY; y < ROWS; y++) {
+        if (board[y].every(v => v)) {
+          const rx = (Math.random() * COLS) | 0;
+          board[y][rx] = 0;
+        }
+      }
+    }
+
+    function checkGoalComplete() {
+      if (!currentGoal) return false;
+      switch (currentGoal.type) {
+        case 'lines': return levelLines >= currentGoal.target;
+        case 'score': return levelScore >= currentGoal.target;
+        case 'color': return levelColorCounts[currentGoal.color] >= currentGoal.target;
+      }
+      return false;
+    }
+
+    function onLevelComplete() {
+      levelComplete = true;
+      paused = true;
+      // Progression: only increment if this is the next unbeaten level
+      const currentIdx0 = stage - 1;
+      if (levelsBeaten === currentIdx0) { levelsBeaten++; saveProgress(); }
+      showLevelCompleteOverlay();
+    }
+
+    function startLevel(idx0) {
+      // Reset per-level state
+      levelScore = 0; levelLines = 0; levelColorCounts = Array(COLORS.length + 1).fill(0);
+      levelComplete = false; gameOver = false; paused = false; resolving = false; inMenu = false;
+      pendingNextPiece = null; clearing = null; clearFade = 0; animToken++;
+      dropAccumulator = 0; last = 0;
+      stage = idx0 + 1;
+      const cfg = getLevelConfig(idx0);
+      dropInterval = cfg.dropMs;
+      currentGoal = cfg.goal;
+      seedStartingRows(cfg.startRows, cfg.density);
+      // Prepare pieces
       current = spawnPiece();
       nextPiece = spawnPiece();
-      score = 0; lines = 0; level = 1;
-      paused = false; gameOver = false;
-      resolving = false; pendingNextPiece = null; clearing = null; clearFade = 0; animToken++;
-      dropInterval = DROP_BASE_MS; dropAccumulator = 0; last = 0;
       updateHUD();
+      hideOverlay();
       render();
     }
 
+    function showMenuOverlay() {
+      overlayTitle.textContent = 'Sand Tetris';
+      overlayDesc.textContent = 'Levels beaten so far and next challenge:';
+      overlayProgress.textContent = String(levelsBeaten);
+      btnPlay.textContent = 'Play';
+      overlayEl.style.display = 'flex';
+      inMenu = true; paused = true;
+    }
+    function showLevelCompleteOverlay() {
+      overlayTitle.textContent = 'Level Complete!';
+      const nextIdx0 = (stage - 1) + 1;
+      const nextCfg = getLevelConfig(nextIdx0);
+      overlayDesc.textContent = 'Next goal: ' + goalToText(nextCfg.goal);
+      overlayProgress.textContent = String(levelsBeaten);
+      btnPlay.textContent = 'Play Next';
+      overlayEl.style.display = 'flex';
+    }
+    function hideOverlay() { overlayEl.style.display = 'none'; }
+
+    // Overlay actions
+    btnPlay.addEventListener('click', () => {
+      if (levelComplete || inMenu) {
+        const nextIdx0 = levelComplete ? (stage - 1) + 1 : levelsBeaten;
+        startLevel(nextIdx0);
+      }
+    });
+    btnReset.addEventListener('click', () => {
+      if (!confirm('Reset progress?')) return;
+      levelsBeaten = 0; saveProgress();
+      showMenuOverlay();
+    });
+
     // Start
+    loadProgress();
     updateHUD();
     render();
+    showMenuOverlay();
     requestAnimationFrame(loop);
   </script>
 </body>
