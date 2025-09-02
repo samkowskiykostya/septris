@@ -142,10 +142,11 @@
         Stack shapes of sand. Clear full rows to score. The wind waits for no block.
       </div>
       <div class="stats">
-        <div class="stat-label">Score</div><div id="score" class="stat-value">0</div>
-        <div class="stat-label">Lines</div><div id="lines" class="stat-value">0</div>
         <div class="stat-label">Level</div><div id="level" class="stat-value">1</div>
-        <div class="stat-label">Goal</div><div id="goal" class="stat-value">—</div>
+        <div class="stat-label">Goals</div>
+        <div id="goals" class="stat-value" style="grid-column: span 1;">
+          <div class="goal-item">—</div>
+        </div>
       </div>
       <div class="next-wrap">
         <div class="stat-label">Next</div>
@@ -166,7 +167,8 @@
     <div id="overlay" class="overlay">
       <div class="overlay-inner">
         <h2 id="overlay-title">Sand Tetris</h2>
-        <p id="overlay-desc">Stack shapes of sand. Clear full rows to score.</p>
+        <p id="overlay-desc">Stack shapes of sand. Meet the goals to advance.</p>
+        <div id="overlay-goals" style="font-size: 14px; margin-top: 6px;"></div>
         <p id="overlay-progress">Levels beaten: <strong id="levels-beaten">0</strong></p>
         <div class="row" style="margin-top: 10px;">
           <button id="btn-play" class="btn">Play</button>
@@ -186,6 +188,7 @@
     const SPEED_PER_STAGE = 0.92; // gentle speed-up per level
     // Matte, sand-friendly palette (4 colors)
     const COLORS = ['#d49f6a', '#e4c979', '#9ebd81', '#7fb3c8'];
+    const COLOR_NAMES = ['Clay', 'Gold', 'Sage', 'Sky'];
 
     // Shapes (tetrominoes)
     const SHAPES = {
@@ -213,10 +216,9 @@
     const btnReset = document.getElementById('btn-reset');
 
     // UI
-    const scoreEl = document.getElementById('score');
-    const linesEl = document.getElementById('lines');
+    // Removed Score/Lines from HUD in favor of goals with progress
     const levelEl = document.getElementById('level');
-    const goalEl = document.getElementById('goal');
+    const goalsEl = document.getElementById('goals');
 
     // Sand pattern generator
     function makeSandPattern(base = '#ecd9ad') {
@@ -326,13 +328,32 @@
     let levelScore = 0;
     let levelLines = 0;
     let levelColorCounts = Array(COLORS.length + 1).fill(0); // index by colorIndex
-    let currentGoal = null; // { type: 'lines'|'score'|'color', target: n, color?: idx }
+    let currentGoals = []; // array of { type: 'lines'|'score'|'color', target: n, color?: idx }
 
     function updateHUD() {
-      scoreEl.textContent = score;
-      linesEl.textContent = lines;
       levelEl.textContent = stage;
-      goalEl.textContent = currentGoal ? goalToText(currentGoal) : '—';
+      // Render goals with progress counters
+      goalsEl.innerHTML = '';
+      if (!currentGoals || currentGoals.length === 0) {
+        goalsEl.innerHTML = '<div class="goal-item">—</div>';
+      } else {
+        for (const g of currentGoals) {
+          const prog = getGoalProgress(g);
+          const total = g.target;
+          const label = goalToText(g);
+          const done = prog >= total;
+          const row = document.createElement('div');
+          row.className = 'goal-item';
+          row.style.opacity = done ? '0.6' : '1';
+          if (g.type === 'color') {
+            const sw = `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:6px;background:${COLORS[g.color-1]};border:1px solid rgba(0,0,0,0.2);"></span>`;
+            row.innerHTML = `${sw}${label}: <strong>${Math.min(prog,total)}/${total}</strong>`;
+          } else {
+            row.innerHTML = `${label}: <strong>${Math.min(prog,total)}/${total}</strong>`;
+          }
+          goalsEl.appendChild(row);
+        }
+      }
     }
 
     function goalToText(goal) {
@@ -340,11 +361,20 @@
         case 'lines': return `Clear ${goal.target} lines`;
         case 'score': return `Score ${goal.target}`;
         case 'color': {
-          const colorName = ['A','B','C','D'][goal.color-1] || 'color';
-          return `Remove ${goal.target} of ${colorName}`;
+          const name = COLOR_NAMES[goal.color-1] || 'Color';
+          return `Remove ${goal.target} ${name}`;
         }
       }
       return '—';
+    }
+
+    function getGoalProgress(goal) {
+      switch (goal.type) {
+        case 'lines': return levelLines;
+        case 'score': return levelScore;
+        case 'color': return levelColorCounts[goal.color] || 0;
+      }
+      return 0;
     }
 
     // Collision
@@ -797,19 +827,56 @@
       localStorage.setItem('sand_levels_beaten', String(levelsBeaten));
     }
 
-    function getLevelConfig(idx0) { // 0-based index
+    function getLevelConfig(idx0) { return buildLevelConfig(idx0); }
+    function previewLevelConfig(idx0) { return buildLevelConfig(idx0); }
+    function buildLevelConfig(idx0) { // deterministic per level
       const speed = Math.max(120, DROP_BASE_MS * Math.pow(SPEED_PER_STAGE, idx0));
       const startRows = Math.min(12, Math.floor(idx0 / 2));
       const density = Math.min(0.6, 0.25 + idx0 * 0.02);
-      const t = idx0 % 3; // rotate goal types
-      if (t === 0) {
-        return { dropMs: speed, startRows, density, goal: { type: 'lines', target: 2 + Math.floor(idx0 / 2) } };
-      } else if (t === 1) {
-        const color = 1 + (Math.random() * COLORS.length | 0);
-        return { dropMs: speed, startRows, density, goal: { type: 'color', color, target: 12 + idx0 * 3 } };
-      } else {
-        return { dropMs: speed, startRows, density, goal: { type: 'score', target: 60 + idx0 * 40 } };
+
+      // Deterministic goal count by bands, gradually increasing complexity
+      let goalCount = 1;
+      if (idx0 >= 3 && idx0 < 8) goalCount = (idx0 % 3 === 0) ? 2 : 1;
+      else if (idx0 >= 8 && idx0 < 16) goalCount = (idx0 % 4 === 1) ? 1 : 2;
+      else if (idx0 >= 16 && idx0 < 28) goalCount = (idx0 % 5 === 0) ? 3 : 2;
+      else if (idx0 >= 28) goalCount = 2 + ((idx0 % 5 === 0) ? 1 : 0) + ((idx0 % 11 === 0) ? 1 : 0);
+      goalCount = Math.min(4, Math.max(1, goalCount));
+
+      // Build deterministic set of goal types: at most one 'lines' and one 'score', rest 'color'
+      const types = [];
+      if (idx0 === 0) { goalCount = 1; types.push('lines'); }
+      else if (idx0 === 1) { goalCount = 1; types.push('color'); }
+      else if (idx0 === 2) { goalCount = 1; types.push('score'); }
+      else {
+        if (idx0 % 2 === 0) types.push('lines');
+        if (idx0 % 3 === 0 || goalCount >= 3) types.push('score');
+        while (types.length < goalCount) types.push('color');
       }
+
+      // Deterministic targets and colors
+      const goals = [];
+      let colorCursor = (idx0 * 3 + 1) % COLORS.length; // start position
+      let extraColorGoals = 0;
+      for (const t of types) {
+        if (t === 'lines') {
+          const base = 2 + Math.floor(idx0 / 3);
+          const adjust = (idx0 % 2);
+          goals.push({ type: 'lines', target: Math.min(12, base + adjust) });
+        } else if (t === 'score') {
+          const base = 50 + idx0 * 22;
+          const adjust = (idx0 % 7) * 2;
+          goals.push({ type: 'score', target: base + adjust });
+        } else if (t === 'color') {
+          const color = 1 + colorCursor;
+          colorCursor = (colorCursor + 2) % COLORS.length; // spread colors deterministically
+          const base = 10 + Math.floor(idx0 * 1.4) + (extraColorGoals * 4);
+          const adjust = (idx0 % 3);
+          goals.push({ type: 'color', color, target: base + adjust });
+          extraColorGoals++;
+        }
+      }
+
+      return { dropMs: speed, startRows, density, goals };
     }
 
     function seedStartingRows(rows, density) {
@@ -861,13 +928,8 @@
     }
 
     function checkGoalComplete() {
-      if (!currentGoal) return false;
-      switch (currentGoal.type) {
-        case 'lines': return levelLines >= currentGoal.target;
-        case 'score': return levelScore >= currentGoal.target;
-        case 'color': return levelColorCounts[currentGoal.color] >= currentGoal.target;
-      }
-      return false;
+      if (!currentGoals || currentGoals.length === 0) return false;
+      return currentGoals.every(g => getGoalProgress(g) >= g.target);
     }
 
     function onLevelComplete() {
@@ -888,7 +950,7 @@
       stage = idx0 + 1;
       const cfg = getLevelConfig(idx0);
       dropInterval = cfg.dropMs;
-      currentGoal = cfg.goal;
+      currentGoals = cfg.goals;
       seedStartingRows(cfg.startRows, cfg.density);
       // Prepare pieces
       current = spawnPiece();
@@ -900,17 +962,37 @@
 
     function showMenuOverlay() {
       overlayTitle.textContent = 'Sand Tetris';
-      overlayDesc.textContent = 'Levels beaten so far and next challenge:';
+      overlayDesc.textContent = 'Next goals:';
       overlayProgress.textContent = String(levelsBeaten);
       btnPlay.textContent = 'Play';
+      // Preview goals for next level
+      const nextIdx0 = levelsBeaten;
+      const preview = previewLevelConfig(nextIdx0);
+      renderOverlayGoals(preview.goals);
       overlayEl.style.display = 'flex';
       inMenu = true; paused = true;
+    }
+
+    function renderOverlayGoals(goals) {
+      const el = document.getElementById('overlay-goals');
+      el.innerHTML = '';
+      for (const g of goals) {
+        const div = document.createElement('div');
+        if (g.type === 'color') {
+          const sw = `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:6px;background:${COLORS[g.color-1]};border:1px solid rgba(0,0,0,0.2);"></span>`;
+          div.innerHTML = `${sw}${goalToText(g)}`;
+        } else {
+          div.textContent = goalToText(g);
+        }
+        el.appendChild(div);
+      }
     }
     function showLevelCompleteOverlay() {
       overlayTitle.textContent = 'Level Complete!';
       const nextIdx0 = (stage - 1) + 1;
-      const nextCfg = getLevelConfig(nextIdx0);
-      overlayDesc.textContent = 'Next goal: ' + goalToText(nextCfg.goal);
+      const nextCfg = previewLevelConfig(nextIdx0);
+      overlayDesc.textContent = 'Next goals:';
+      renderOverlayGoals(nextCfg.goals);
       overlayProgress.textContent = String(levelsBeaten);
       btnPlay.textContent = 'Play Next';
       overlayEl.style.display = 'flex';
