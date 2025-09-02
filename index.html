@@ -262,7 +262,7 @@
     let gameOver = false;
     let resolving = false; // animating clears
     let pendingNextPiece = null; // spawn after clears
-    let clearing = null; // { cells: Set<'x,y'>, lineRows: number, endTime: number }
+    let clearing = null; // { cells: Set<'x,y'>, lineRows: number[], endTime: number }
     let clearFade = 0; // 0..1 fade progress for clearing
     let animToken = 0; // invalidates pending animations on restart
 
@@ -308,21 +308,22 @@
       }
     }
 
-    // Gravity: collapse columns after removals
-    function applyGravity() {
-      for (let x = 0; x < COLS; x++) {
-        let write = ROWS - 1;
-        for (let y = ROWS - 1; y >= 0; y--) {
-          if (board[y][x]) {
-            const val = board[y][x];
-            if (write !== y) {
-              board[write][x] = val;
-              board[y][x] = 0;
-            }
-            write--;
+    // Gravity for line clears only: shift intact rows down, preserve gaps
+    function applyLineClearGravity(lineRows) {
+      if (!lineRows || lineRows.length === 0) return;
+      const cleared = new Set(lineRows);
+      let write = ROWS - 1;
+      for (let y = ROWS - 1; y >= 0; y--) {
+        if (!cleared.has(y)) {
+          if (write !== y) {
+            board[write] = board[y].slice();
           }
+          write--;
         }
-        for (let y = write; y >= 0; y--) board[y][x] = 0;
+      }
+      // Fill the remaining rows at the top with zeros
+      for (let y = write; y >= 0; y--) {
+        board[y] = Array(COLS).fill(0);
       }
     }
 
@@ -385,7 +386,8 @@
         return;
       }
       const token = animToken;
-      clearing = { cells: clears.cells, lineRows: clears.lineRows.length, endTime: performance.now() + 500 };
+      // Keep full line rows array so we can apply row-based gravity only for lines
+      clearing = { cells: clears.cells, lineRows: clears.lineRows, endTime: performance.now() + 500 };
       setTimeout(() => {
         if (token !== animToken) return; // aborted
         let removed = 0;
@@ -394,10 +396,11 @@
           if (board[sy][sx]) { board[sy][sx] = 0; removed++; }
         }
         score += removed;
-        lines += clearing.lineRows;
+        lines += clearing.lineRows.length;
         setLevelFromLines();
         updateHUD();
-        applyGravity();
+        // Only apply gravity for line clears. Cluster clears leave gaps.
+        applyLineClearGravity(clearing.lineRows);
         clearing = null;
         clearFade = 0;
         setTimeout(() => { if (token === animToken) resolveStep(); }, 20);
