@@ -157,8 +157,9 @@
         <div><strong>↑ / Z / X</strong>: Rotate</div>
         <div><strong>↓</strong>: Soft drop</div>
         <div><strong>Space</strong>: Hard drop</div>
-        <div><strong>P</strong>: Pause</div>
+        <div><strong>Esc</strong>: Pause</div>
         <div><strong>R</strong>: Restart</div>
+        <div><strong>I</strong>: Info / Rules</div>
       </div>
       <div class="footer">Made of pixels and sand.</div>
     </div>
@@ -186,9 +187,9 @@
 
     const DROP_BASE_MS = 900; // base drop interval
     const SPEED_PER_STAGE = 0.92; // gentle speed-up per level
-    // Matte, sand-friendly palette (4 colors)
-    const COLORS = ['#d49f6a', '#e4c979', '#9ebd81', '#7fb3c8'];
-    const COLOR_NAMES = ['Clay', 'Gold', 'Sage', 'Sky'];
+    // Vibrant, high-contrast palette
+    const COLORS = ['#ff5d57', '#ffd166', '#06d6a0', '#118ab2', '#8338ec', '#ef476f'];
+    const COLOR_NAMES = ['Rose', 'Amber', 'Mint', 'Azure', 'Violet', 'Coral'];
 
     // Shapes (tetrominoes)
     const SHAPES = {
@@ -321,6 +322,7 @@
     let clearFade = 0; // 0..1 fade progress for clearing
     let animToken = 0; // invalidates pending animations on restart
     let inMenu = true;
+    let inInfo = false;
     let levelComplete = false;
     let levelsBeaten = 0;
 
@@ -328,7 +330,8 @@
     let levelScore = 0;
     let levelLines = 0;
     let levelColorCounts = Array(COLORS.length + 1).fill(0); // index by colorIndex
-    let currentGoals = []; // array of { type: 'lines'|'score'|'color', target: n, color?: idx }
+    let levelClusterBlocks = 0; // blocks cleared via 5+ clusters
+    let currentGoals = []; // array of { type: 'lines'|'score'|'color'|'cluster', target: n, color?: idx }
 
     function updateHUD() {
       levelEl.textContent = stage;
@@ -364,6 +367,7 @@
           const name = COLOR_NAMES[goal.color-1] || 'Color';
           return `Remove ${goal.target} ${name}`;
         }
+        case 'cluster': return `Clear ${goal.target} cluster blocks`;
       }
       return '—';
     }
@@ -373,6 +377,7 @@
         case 'lines': return levelLines;
         case 'score': return levelScore;
         case 'color': return levelColorCounts[goal.color] || 0;
+        case 'cluster': return levelClusterBlocks;
       }
       return 0;
     }
@@ -466,7 +471,8 @@
       const cells = new Set();
       for (const y of lineRows) for (let x = 0; x < COLS; x++) cells.add(`${x},${y}`);
       for (const [x,y] of colorCells) cells.add(`${x},${y}`);
-      return { cells, lineRows };
+      const clusterSet = new Set(colorCells.map(([x,y]) => `${x},${y}`));
+      return { cells, lineRows, clusterSet };
     }
 
     function resolveStep() {
@@ -484,10 +490,11 @@
       }
       const token = animToken;
       // Keep full line rows array so we can apply row-based gravity only for lines
-      clearing = { cells: clears.cells, lineRows: clears.lineRows, endTime: performance.now() + 500 };
+      clearing = { cells: clears.cells, lineRows: clears.lineRows, clusterSet: clears.clusterSet, endTime: performance.now() + 500 };
       setTimeout(() => {
         if (token !== animToken) return; // aborted
         let removed = 0;
+        let removedCluster = 0;
         const removedByColor = Array(COLORS.length + 1).fill(0);
         for (const key of clearing.cells) {
           const [sx, sy] = key.split(',').map(Number);
@@ -495,6 +502,7 @@
           if (val) {
             removed++;
             removedByColor[val]++;
+            if (clearing.clusterSet && clearing.clusterSet.has(key)) removedCluster++;
             board[sy][sx] = 0;
           }
         }
@@ -504,6 +512,7 @@
         levelScore += removed;
         levelLines += clearing.lineRows.length;
         for (let i = 1; i < removedByColor.length; i++) levelColorCounts[i] += removedByColor[i];
+        levelClusterBlocks += removedCluster;
         updateHUD();
         // Only apply gravity for line clears. Cluster clears leave gaps.
         applyLineClearGravity(clearing.lineRows);
@@ -538,7 +547,7 @@
     }
 
     // Draw helpers
-    function drawCellAt(g, px, py, size, colorIndex, tintAlpha = 0.4) {
+    function drawCellAt(g, px, py, size, colorIndex, tintAlpha = 0.7) {
       // Base sand fill
       g.fillStyle = sandPattern;
       g.fillRect(px, py, size, size);
@@ -564,7 +573,7 @@
       }
     }
 
-    function drawCell(g, x, y, size, colorIndex, overallAlpha = 1, tintAlpha = 0.4) {
+    function drawCell(g, x, y, size, colorIndex, overallAlpha = 1, tintAlpha = 0.7) {
       const px = x * size;
       const py = y * size;
       g.save();
@@ -744,7 +753,7 @@
       ctx.fillStyle = '#5a4e2c';
       ctx.textAlign = 'center';
       ctx.font = 'bold 18px system-ui, sans-serif';
-      ctx.fillText('Paused — P to resume', canvas.width/2, 52);
+      ctx.fillText('Paused — Esc to resume', canvas.width/2, 52);
       ctx.restore();
     }
 
@@ -770,7 +779,16 @@
     document.addEventListener('keydown', (e) => {
       if (gameOver && e.key.toLowerCase() === 'r') { restart(); return; }
       if (inMenu || levelComplete) return;
-      if (e.key.toLowerCase() === 'p') { paused = !paused; return; }
+      // Info toggle
+      if (e.key.toLowerCase() === 'i') {
+        if (inInfo) { hideOverlay(); inInfo = false; paused = false; } else { showInfoOverlay(); }
+        return;
+      }
+      // Pause toggle on Escape
+      if (e.key === 'Escape') {
+        if (inInfo) { hideOverlay(); inInfo = false; paused = false; } else { paused = !paused; }
+        return;
+      }
       if (paused || resolving || !current) return;
       switch (e.key) {
         case 'ArrowLeft':
@@ -842,15 +860,20 @@
       else if (idx0 >= 28) goalCount = 2 + ((idx0 % 5 === 0) ? 1 : 0) + ((idx0 % 11 === 0) ? 1 : 0);
       goalCount = Math.min(4, Math.max(1, goalCount));
 
-      // Build deterministic set of goal types: at most one 'lines' and one 'score', rest 'color'
+      // Build deterministic set of goal types: prefer frequent 'cluster' goals
       const types = [];
       if (idx0 === 0) { goalCount = 1; types.push('lines'); }
-      else if (idx0 === 1) { goalCount = 1; types.push('color'); }
+      else if (idx0 === 1) { goalCount = 1; types.push('cluster'); }
       else if (idx0 === 2) { goalCount = 1; types.push('score'); }
       else {
         if (idx0 % 2 === 0) types.push('lines');
         if (idx0 % 3 === 0 || goalCount >= 3) types.push('score');
-        while (types.length < goalCount) types.push('color');
+        while (types.length < goalCount) {
+          const haveCluster = types.filter(t => t === 'cluster').length;
+          const haveColor = types.filter(t => t === 'color').length;
+          // Bias towards cluster more often than color
+          types.push(haveCluster <= haveColor + 1 ? 'cluster' : 'color');
+        }
       }
 
       // Deterministic targets and colors
@@ -873,6 +896,10 @@
           const adjust = (idx0 % 3);
           goals.push({ type: 'color', color, target: base + adjust });
           extraColorGoals++;
+        } else if (t === 'cluster') {
+          const base = 16 + Math.floor(idx0 * 2.2);
+          const adjust = (idx0 % 5) * 2;
+          goals.push({ type: 'cluster', target: base + adjust });
         }
       }
 
@@ -943,8 +970,8 @@
 
     function startLevel(idx0) {
       // Reset per-level state
-      levelScore = 0; levelLines = 0; levelColorCounts = Array(COLORS.length + 1).fill(0);
-      levelComplete = false; gameOver = false; paused = false; resolving = false; inMenu = false;
+      levelScore = 0; levelLines = 0; levelColorCounts = Array(COLORS.length + 1).fill(0); levelClusterBlocks = 0;
+      levelComplete = false; gameOver = false; paused = false; resolving = false; inMenu = false; inInfo = false;
       pendingNextPiece = null; clearing = null; clearFade = 0; animToken++;
       dropAccumulator = 0; last = 0;
       stage = idx0 + 1;
@@ -971,6 +998,21 @@
       renderOverlayGoals(preview.goals);
       overlayEl.style.display = 'flex';
       inMenu = true; paused = true;
+    }
+
+    function showInfoOverlay() {
+      const elGoals = document.getElementById('overlay-goals');
+      elGoals.innerHTML = '';
+      overlayTitle.textContent = 'How to Play';
+      overlayDesc.innerHTML = [
+        'Stack falling shapes. Clear full rows to score.',
+        'Clear groups of 5+ connected same-color blocks to earn extra “cluster” clears.',
+        'Finish all goals on the left to advance.'
+      ].map(t => `<div style="margin:4px 0;">• ${t}</div>`).join('');
+      overlayProgress.textContent = String(levelsBeaten);
+      btnPlay.textContent = 'Resume';
+      overlayEl.style.display = 'flex';
+      inInfo = true; paused = true;
     }
 
     function renderOverlayGoals(goals) {
@@ -1001,6 +1043,9 @@
 
     // Overlay actions
     btnPlay.addEventListener('click', () => {
+      if (inInfo) {
+        hideOverlay(); inInfo = false; paused = false; return;
+      }
       if (levelComplete || inMenu) {
         const nextIdx0 = levelComplete ? (stage - 1) + 1 : levelsBeaten;
         startLevel(nextIdx0);
